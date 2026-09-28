@@ -1,0 +1,1193 @@
+--[[
+    3artAim · Drill Edition  (Refactored RU)
+    Полностью на русском. Без обфускации.
+    Игра: Drill to Earth's Core
+]]
+
+--=== 1. ЗАГРУЗКА OBSIDIAN ===
+local Library = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/Library.lua"
+))()
+
+--=== 2. СЕРВИСЫ ===
+local cloneref = cloneref or function(o) return o end
+local Players = cloneref(game:GetService("Players"))
+local RunService = cloneref(game:GetService("RunService"))
+local UIS = cloneref(game:GetService("UserInputService"))
+local Workspace = cloneref(game:GetService("Workspace"))
+local CoreGui = cloneref(game:GetService("CoreGui"))
+local Lighting = cloneref(game:GetService("Lighting"))
+local CollectionService = cloneref(game:GetService("CollectionService"))
+local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
+
+local LP = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    Camera = Workspace.CurrentCamera
+end)
+
+--=== 3. КОНФИГ ===
+local Cfg = {
+    AimEnabled         = false,
+    TargetCategory     = "NPCs",
+    AimBone            = "Head",
+    FOVRadius          = 136,
+    FOVStroke          = 1,
+    FOVTint            = Color3.fromRGB(128, 0, 128),
+    ShowFOV            = false,
+    AimSmoothing       = 0.15,
+    VelocityPrediction = 0.08,
+    AdvancedPrediction = false,
+    WallValidation     = true,
+    UseRangeLimit      = false,
+    MaxAimDistance     = 200,
+    RespectTeams       = false,
+    BlacklistedNPCs    = {},
+
+    ShowTracers        = false,
+    TracerColor        = Color3.fromRGB(255, 0, 0),
+    TracerWidth        = 1,
+    ShowNametags       = false,
+    NametagColor       = Color3.fromRGB(255, 255, 255),
+    NametagFontSize    = 12,
+    ShowGlow           = false,
+    GlowOutline        = Color3.fromRGB(0, 255, 0),
+    OreESP             = false,
+    FullBright         = false,
+
+    AutoFire           = false,
+    FireRate           = 0.1,
+    AutoSwing          = false,
+    SwingRadius        = 15,
+    SwingCooldown      = 0.6,
+    AutoHarvest        = false,
+    HarvestRadius      = 12,
+    HarvestCooldown    = 0.22,
+
+    AutoLootChest      = false,
+    ChestScanRadius    = 500,
+    AutoAutoCollect    = false,
+    AutoCollectBlacklist = {},
+
+    PhaseShift         = false,
+    RapidMovement      = false,
+    MovementSpeed      = 50,
+    AerialControl      = false,
+    FlightSpeed        = 50,
+    InfiniteAirJump    = false,
+    AntiTrainStuck     = false,
+
+    CameraDistance     = 500,
+
+    InvisToggle        = false,
+    AccurateRepToggle  = false,
+    GodModeStuds       = 7,
+}
+
+--=== 4. РЕЕСТР СОЕДИНЕНИЙ ===
+local Connections = {}
+local RenderSteps = {}
+local function track(c) table.insert(Connections, c); return c end
+local function trackRender(n, p, f)
+    RunService:BindToRenderStep(n, p, f)
+    table.insert(RenderSteps, n)
+end
+
+--=== 5. ХЕЛПЕРЫ ===
+local function parts(model)
+    if not model then return nil, nil, nil end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    local root = model:FindFirstChild("HumanoidRootPart")
+        or model:FindFirstChild("UpperTorso")
+        or model:FindFirstChild("Torso")
+        or model.PrimaryPart
+    local head = model:FindFirstChild("Head")
+    return hum, root, head
+end
+
+local function blacklisted(name)
+    return table.find(Cfg.BlacklistedNPCs, name) ~= nil
+end
+
+local function sameTeam(model)
+    if not Cfg.RespectTeams then return false end
+    local p = Players:GetPlayerFromCharacter(model)
+    if not p or not LP.Team or not p.Team then return false end
+    return p.Team == LP.Team
+end
+
+--=== 6. КЭШ NPC ===
+local NPCCache = {}
+
+local function isValidNPC(m)
+    if not m or not m:IsA("Model") then return false end
+    if m == LP.Character then return false end
+    if Players:GetPlayerFromCharacter(m) then return false end
+    if m:GetAttribute("NpcFaction") ~= "Enemy" then return false end
+    local h, r = parts(m)
+    return h and h.Health > 0 and r ~= nil
+end
+
+local function addNPC(m)
+    if isValidNPC(m) and not table.find(NPCCache, m) then
+        table.insert(NPCCache, m)
+        local hum = m:FindFirstChildOfClass("Humanoid")
+        if hum then
+            track(hum.HealthChanged:Connect(function(v)
+                if v <= 0 then
+                    local i = table.find(NPCCache, m)
+                    if i then table.remove(NPCCache, i) end
+                    local g = m:FindFirstChild("3artAimGlow")
+                    if g then g:Destroy() end
+                end
+            end))
+        end
+    end
+end
+
+local function removeNPC(m)
+    for i = #NPCCache, 1, -1 do
+        if NPCCache[i] == m or (NPCCache[i] and m:IsDescendantOf(NPCCache[i])) then
+            table.remove(NPCCache, i)
+        end
+    end
+end
+
+track(Workspace.DescendantAdded:Connect(function(o)
+    if o:IsA("Model") then task.defer(function() if o.Parent then addNPC(o) end end) end
+end))
+track(Workspace.DescendantRemoving:Connect(function(o)
+    if o:IsA("Model") then removeNPC(o) end
+end))
+
+task.spawn(function()
+    for _, o in ipairs(Workspace:GetDescendants()) do
+        if o:IsA("Model") then addNPC(o) end
+    end
+end)
+
+--=== 7. АИМБОТ ===
+local function aimPos(model)
+    local hum, root, head = parts(model)
+    local part
+    if Cfg.AimBone == "Head" then part = head or root
+    elseif Cfg.AimBone == "UpperTorso" then
+        part = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso") or root
+    elseif Cfg.AimBone == "HumanoidRootPart" then part = root or head
+    else part = head or root end
+    if not part or not part:IsA("BasePart") then return nil, nil end
+
+    local vel = part.AssemblyLinearVelocity or Vector3.zero
+    local pred = Cfg.VelocityPrediction
+    if Cfg.AdvancedPrediction then
+        local inAir = hum and hum.FloorMaterial == Enum.Material.Air
+        local drop = inAir and Vector3.new(0, 0.5 * Workspace.Gravity * pred * pred, 0)
+                            or Vector3.zero
+        return part.Position + vel * pred - drop, part
+    end
+    return part.Position + vel * pred, part
+end
+
+local function findTarget()
+    local center = Camera.ViewportSize / 2
+    local list = {}
+
+    if Cfg.TargetCategory == "Players" or Cfg.TargetCategory == "Both" then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LP and p.Character and not sameTeam(p.Character) then
+                local h = p.Character:FindFirstChildOfClass("Humanoid")
+                if h and h.Health > 0 then table.insert(list, p.Character) end
+            end
+        end
+    end
+    if Cfg.TargetCategory == "NPCs" or Cfg.TargetCategory == "Both" then
+        for _, n in ipairs(NPCCache) do
+            if n.Parent and not blacklisted(n.Name) then table.insert(list, n) end
+        end
+    end
+
+    local scored = {}
+    for _, m in ipairs(list) do
+        local pos, part = aimPos(m)
+        if pos and part then
+            local dist = (Camera.CFrame.Position - part.Position).Magnitude
+            if not Cfg.UseRangeLimit or dist <= Cfg.MaxAimDistance then
+                local sp, on = Camera:WorldToViewportPoint(pos)
+                if on and sp.Z > 0 then
+                    local off = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                    if off <= Cfg.FOVRadius then
+                        table.insert(scored, { Model = m, Pos = pos, Offset = off })
+                    end
+                end
+            end
+        end
+    end
+    if #scored == 0 then return nil, nil end
+    table.sort(scored, function(a, b) return a.Offset < b.Offset end)
+    local best = scored[1]
+
+    if Cfg.WallValidation then
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { LP.Character, best.Model }
+        params.IgnoreWater = true
+        local origin = Camera.CFrame.Position
+        local hit = Workspace:Raycast(origin, best.Pos - origin, params)
+        if hit and hit.Instance and not hit.Instance:IsDescendantOf(best.Model) then
+            return nil, nil
+        end
+    end
+    return best.Model, best.Pos
+end
+
+local function smoothAim(pos)
+    if not pos then return end
+    local cur = Camera.CFrame
+    Camera.CFrame = cur:Lerp(CFrame.new(cur.Position, pos), Cfg.AimSmoothing)
+end
+--=== 8. ESP ===
+local EspGui = Instance.new("ScreenGui")
+EspGui.Name = "3artAimVisuals"
+EspGui.IgnoreGuiInset = true
+EspGui.Parent = CoreGui
+
+local FOVFrame = Instance.new("Frame")
+FOVFrame.BackgroundTransparency = 1
+FOVFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+FOVFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+FOVFrame.Parent = EspGui
+Instance.new("UICorner", FOVFrame).CornerRadius = UDim.new(1, 0)
+local FOVStroke = Instance.new("UIStroke", FOVFrame)
+
+local Tracers, Nametags = {}, {}
+
+local function renderESP()
+    local vp = Camera.ViewportSize
+    local gs = EspGui.AbsoluteSize
+    if gs.X == 0 or gs.Y == 0 then return end
+    local sx, sy = vp.X / gs.X, vp.Y / gs.Y
+
+    if FOVStroke then
+        local r = Cfg.FOVRadius * sx
+        FOVFrame.Size = UDim2.new(0, r * 2, 0, r * 2)
+        FOVFrame.Position = UDim2.new(0, gs.X / 2, 0, gs.Y / 2)
+        FOVFrame.Visible = Cfg.ShowFOV
+        FOVStroke.Thickness = Cfg.FOVStroke
+        FOVStroke.Color = Cfg.FOVTint
+    end
+
+    local active, list = {}, {}
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP and p.Character and not sameTeam(p.Character) then
+            local h = p.Character:FindFirstChildOfClass("Humanoid")
+            if h and h.Health > 0 then
+                table.insert(list, { Obj = p.Character, Name = p.Name })
+            end
+        end
+    end
+    for _, n in ipairs(NPCCache) do
+        if n.Parent and not blacklisted(n.Name) then
+            local h = n:FindFirstChildOfClass("Humanoid")
+            if not h or h.Health > 0 then
+                table.insert(list, { Obj = n, Name = n.Name })
+            end
+        end
+    end
+
+    local top = Vector2.new(gs.X / 2, 0)
+
+    for _, e in ipairs(list) do
+        local _, _, head = parts(e.Obj)
+        local ref = head or e.Obj.PrimaryPart
+        if ref then
+            local dist = (Camera.CFrame.Position - ref.Position).Magnitude
+            local id = e.Obj:GetDebugId()
+            local namePos
+
+            if Cfg.ShowNametags then
+                local sp, on = Camera:WorldToViewportPoint(ref.Position + Vector3.new(0, 2.5, 0))
+                if on then
+                    namePos = Vector2.new(sp.X / sx, sp.Y / sy)
+                    local lbl = Nametags[id]
+                    if not lbl then
+                        lbl = Instance.new("TextLabel")
+                        lbl.BackgroundTransparency = 1
+                        lbl.Font = Enum.Font.GothamBold
+                        lbl.TextStrokeTransparency = 0.5
+                        lbl.AnchorPoint = Vector2.new(0.5, 0.5)
+                        lbl.Parent = EspGui
+                        Nametags[id] = lbl
+                    end
+                    lbl.Text = string.format("%s [%d]", e.Name, math.floor(dist))
+                    lbl.TextSize = Cfg.NametagFontSize
+                    lbl.TextColor3 = Cfg.NametagColor
+                    lbl.Position = UDim2.new(0, namePos.X, 0, namePos.Y)
+                    lbl.Visible = true
+                    active[id] = true
+                end
+            end
+
+            if Cfg.ShowTracers then
+                local sp, on = Camera:WorldToViewportPoint(ref.Position)
+                if on then
+                    local endPos = Vector2.new(sp.X / sx, sp.Y / sy)
+                    if namePos then
+                        endPos = Vector2.new(namePos.X, namePos.Y - Cfg.NametagFontSize / 2 - 4)
+                    end
+                    local tr = Tracers[id]
+                    if not tr then
+                        tr = Instance.new("Frame")
+                        tr.BorderSizePixel = 0
+                        tr.AnchorPoint = Vector2.new(0.5, 0.5)
+                        tr.Parent = EspGui
+                        Tracers[id] = tr
+                    end
+                    local mid = (top + endPos) / 2
+                    local len = (top - endPos).Magnitude
+                    local ang = math.deg(math.atan2(endPos.Y - top.Y, endPos.X - top.X))
+                    tr.Position = UDim2.new(0, mid.X, 0, mid.Y)
+                    tr.Size = UDim2.new(0, len, 0, Cfg.TracerWidth)
+                    tr.Rotation = ang
+                    tr.BackgroundColor3 = Cfg.TracerColor
+                    tr.Visible = true
+                    active[id] = true
+                end
+            end
+
+            if Cfg.ShowGlow then
+                local g = e.Obj:FindFirstChild("3artAimGlow")
+                if not g then
+                    g = Instance.new("Highlight")
+                    g.Name = "3artAimGlow"
+                    g.FillTransparency = 1
+                    g.Adornee = e.Obj
+                    g.Parent = e.Obj
+                end
+                g.OutlineColor = Cfg.GlowOutline
+                g.OutlineTransparency = 0
+            end
+        end
+    end
+
+    for id, t in pairs(Tracers) do
+        if not active[id] then t:Destroy(); Tracers[id] = nil end
+    end
+    for id, l in pairs(Nametags) do
+        if not active[id] then l:Destroy(); Nametags[id] = nil end
+    end
+end
+
+--=== 9. FULLBRIGHT ===
+local lbk = {
+    Brightness = Lighting.Brightness,
+    GlobalShadows = Lighting.GlobalShadows,
+    FogEnd = Lighting.FogEnd,
+    OutdoorAmbient = Lighting.OutdoorAmbient,
+    Ambient = Lighting.Ambient,
+    ColorShift_Top = Lighting.ColorShift_Top,
+    ColorShift_Bottom = Lighting.ColorShift_Bottom,
+}
+
+local function applyFullBright(on)
+    if on then
+        Lighting.Brightness = 8
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 9e9
+        Lighting.OutdoorAmbient = Color3.fromRGB(128, 128, 128)
+        Lighting.Ambient = Color3.fromRGB(128, 128, 128)
+        Lighting.ColorShift_Top = Color3.new()
+        Lighting.ColorShift_Bottom = Color3.new()
+    else
+        for k, v in pairs(lbk) do
+            pcall(function() Lighting[k] = v end)
+        end
+    end
+end
+
+--=== 10. КАМЕРА (отдаление экрана) ===
+local function applyCameraDistance(dist)
+    pcall(function()
+        LP.CameraMaxZoomDistance = dist
+        LP.CameraMinZoomDistance = 0.5
+    end)
+end
+
+--=== 11. NO CLIP (Phase Shift) ===
+local noclipConn
+local function applyNoClip(on)
+    if noclipConn then noclipConn:Disconnect(); noclipConn = nil end
+    if not on then return end
+    noclipConn = RunService.Stepped:Connect(function()
+        local c = LP.Character
+        if not c then return end
+        for _, p in ipairs(c:GetDescendants()) do
+            if p:IsA("BasePart") then p.CanCollide = false end
+        end
+    end)
+end
+
+--=== 12. СКОРОСТЬ ===
+local function setSpeed(sp)
+    local c = LP.Character
+    local h = c and c:FindFirstChildOfClass("Humanoid")
+    if h then h.WalkSpeed = sp end
+end
+
+-- Удержание скорости через Heartbeat (не даёт игре сбросить)
+track(RunService.Heartbeat:Connect(function()
+    if not Cfg.RapidMovement then return end
+    local c = LP.Character
+    local h = c and c:FindFirstChildOfClass("Humanoid")
+    if h and h.WalkSpeed ~= Cfg.MovementSpeed then
+        h.WalkSpeed = Cfg.MovementSpeed
+    end
+end))
+
+--=== 13. FLY (Aerial Control) ===
+local Fly = { active = false, up = 0, down = 0, gyro = nil, vel = nil, conns = {} }
+
+local function stopFly()
+    for _, c in ipairs(Fly.conns) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(Fly.conns)
+    if Fly.gyro then Fly.gyro:Destroy(); Fly.gyro = nil end
+    if Fly.vel then Fly.vel:Destroy(); Fly.vel = nil end
+    Fly.up, Fly.down, Fly.active = 0, 0, false
+    local c = LP.Character
+    if c then
+        local h = c:FindFirstChildOfClass("Humanoid")
+        if h then h.PlatformStand = false; h.AutoRotate = true end
+        local a = c:FindFirstChild("Animate")
+        if a then a.Disabled = false end
+    end
+    if Camera then Camera.CameraType = Enum.CameraType.Custom end
+end
+
+local function startFly()
+    stopFly()
+    local c = LP.Character
+    if not c then return end
+    local h = c:FindFirstChildOfClass("Humanoid")
+    local r = c:FindFirstChild("HumanoidRootPart")
+    if not h or not r then return end
+    h.PlatformStand = true
+    local a = c:FindFirstChild("Animate")
+    if a then a.Disabled = true end
+    if Camera then Camera.CameraType = Enum.CameraType.Track end
+
+    Fly.active = true
+    Fly.gyro = Instance.new("BodyGyro", r)
+    Fly.gyro.P = 90000
+    Fly.gyro.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+    Fly.gyro.CFrame = r.CFrame
+
+    Fly.vel = Instance.new("BodyVelocity", r)
+    Fly.vel.Velocity = Vector3.zero
+    Fly.vel.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+
+    table.insert(Fly.conns, RunService.RenderStepped:Connect(function()
+        if not Fly.active then return end
+        local ch = LP.Character
+        local rt = ch and ch:FindFirstChild("HumanoidRootPart")
+        if not rt or not Camera then return end
+
+        local mv = Vector3.zero
+        if UIS:IsKeyDown(Enum.KeyCode.W) then mv += Camera.CFrame.LookVector end
+        if UIS:IsKeyDown(Enum.KeyCode.S) then mv -= Camera.CFrame.LookVector end
+        if UIS:IsKeyDown(Enum.KeyCode.A) then mv -= Camera.CFrame.RightVector end
+        if UIS:IsKeyDown(Enum.KeyCode.D) then mv += Camera.CFrame.RightVector end
+        mv += Vector3.new(0, 1, 0) * (Fly.up + Fly.down)
+
+        local sp = math.clamp(Cfg.FlightSpeed, 0, 500)
+        Fly.vel.Velocity = mv.Magnitude > 0 and mv.Unit * sp or Vector3.zero
+        Fly.gyro.CFrame = Camera.CFrame
+    end))
+
+    table.insert(Fly.conns, UIS.InputBegan:Connect(function(i, gp)
+        if gp or UIS:GetFocusedTextBox() then return end
+        if i.KeyCode == Enum.KeyCode.E then Fly.up = 1
+        elseif i.KeyCode == Enum.KeyCode.Q then Fly.down = -1 end
+    end))
+
+    table.insert(Fly.conns, UIS.InputEnded:Connect(function(i)
+        if i.KeyCode == Enum.KeyCode.E then Fly.up = 0
+        elseif i.KeyCode == Enum.KeyCode.Q then Fly.down = 0 end
+    end))
+end
+
+--=== 14. AIR JUMP ===
+local airJumpConn
+local function applyAirJump(on)
+    if airJumpConn then airJumpConn:Disconnect(); airJumpConn = nil end
+    if not on then return end
+    airJumpConn = UIS.JumpRequest:Connect(function()
+        local c = LP.Character
+        local h = c and c:FindFirstChildOfClass("Humanoid")
+        if h and h:GetState() == Enum.HumanoidStateType.Freefall then
+            h:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end)
+end
+
+--=== 15. АНТИ-ЗАСТРЕВАНИЕ В ПОЕЗДЕ ===
+local trainConn
+local function applyAntiTrain(on)
+    if trainConn then trainConn:Disconnect(); trainConn = nil end
+    if not on then return end
+    trainConn = RunService.Heartbeat:Connect(function()
+        local c = LP.Character
+        local h = c and c:FindFirstChildOfClass("Humanoid")
+        local r = c and c:FindFirstChild("HumanoidRootPart")
+        if not h or not r then return end
+
+        if h.Sit then
+            pcall(function()
+                h.Sit = false
+                h:ChangeState(Enum.HumanoidStateType.GettingUp)
+            end)
+        end
+
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("BasePart") then
+                local n = obj.Name:lower()
+                if n:find("train") or n:find("tren")
+                    or n:find("cart") or n:find("wagon") then
+                    if obj.CanCollide then
+                        pcall(function() obj.CanCollide = false end)
+                    end
+                end
+            end
+        end
+    end)
+end
+--=== 16. БОЙ: инструменты ===
+local function getTool(class)
+    local c = LP.Character
+    if not c then return nil end
+    for _, t in ipairs(c:GetChildren()) do
+        if t:IsA("Tool") then
+            if class == nil then
+                if t:GetAttribute("Class") ~= "Pickaxe" then return t end
+            else
+                if t:GetAttribute("Class") == class then return t end
+            end
+        end
+    end
+end
+
+local function nearbyNPCs(radius)
+    local c = LP.Character
+    local r = c and c:FindFirstChild("HumanoidRootPart")
+    if not r then return {} end
+    local out = {}
+    for _, n in ipairs(NPCCache) do
+        if n.Parent and not blacklisted(n.Name) then
+            local h = n:FindFirstChildOfClass("Humanoid")
+            local np = n:FindFirstChild("HumanoidRootPart") or n.PrimaryPart
+            if h and h.Health > 0 and np
+                and (np.Position - r.Position).Magnitude <= radius then
+                table.insert(out, n)
+            end
+        end
+    end
+    return out
+end
+
+--=== 17. АВТО-СТРЕЛЬБА ===
+task.spawn(function()
+    while true do
+        task.wait(Cfg.FireRate)
+        if Cfg.AutoFire then
+            local w = getTool(nil)
+            if w and w.Parent == LP.Character then
+                pcall(function() w:Activate() end)
+            end
+        end
+    end
+end)
+
+--=== 18. АВТО-ВЗМАХ (по NPC рядом) ===
+task.spawn(function()
+    while true do
+        task.wait(Cfg.SwingCooldown)
+        if Cfg.AutoSwing then
+            local tool = getTool(nil)
+            local t = nearbyNPCs(Cfg.SwingRadius)
+            if tool and #t > 0 then
+                pcall(function() tool:Activate() end)
+            end
+        end
+    end
+end)
+
+--=== 19. АВТО-КИРКА ===
+task.spawn(function()
+    while true do
+        task.wait(Cfg.HarvestCooldown)
+        if Cfg.AutoHarvest then
+            local pk = getTool("Pickaxe")
+            if pk then
+                pcall(function() pk:Activate() end)
+            end
+        end
+    end
+end)
+
+--=== 20. АВТО-СБОР ПРЕДМЕТОВ ===
+task.spawn(function()
+    while true do
+        task.wait(0.15)
+        if Cfg.AutoAutoCollect then
+            pcall(function()
+                local c = LP.Character
+                local r = c and c:FindFirstChild("HumanoidRootPart")
+                if not r then return end
+
+                local items = Workspace:FindFirstChild("Items")
+                if not items then return end
+
+                local cnt = 0
+                for _, it in ipairs(items:GetChildren()) do
+                    if cnt >= 5 then break end
+                    if (it:IsA("BasePart") or it:IsA("Model"))
+                        and not table.find(Cfg.AutoCollectBlacklist, it.Name) then
+
+                        local blocked = it:GetAttribute("Blocked") == true
+                            or it.Name == "Money_Sack"
+                            or it.Name == "SoulOrb"
+                        local shop = it:GetAttribute("ShopItem") == true
+
+                        if not blocked and not shop then
+                            local p = it:IsA("BasePart") and it.Position
+                                or (it.PrimaryPart and it.PrimaryPart.Position)
+                            if p and (p - r.Position).Magnitude < 25 then
+                                r.CFrame = CFrame.new(p + Vector3.new(0, 3, 0))
+                                cnt = cnt + 1
+                                task.wait(0.05)
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+--=== 21. АВТО-ЛУТ СУНДУКОВ ===
+task.spawn(function()
+    while true do
+        task.wait(0.3)
+        if Cfg.AutoLootChest then
+            pcall(function()
+                local c = LP.Character
+                local r = c and c:FindFirstChild("HumanoidRootPart")
+                if not r then return end
+
+                local best, bestD = nil, math.huge
+                for _, o in ipairs(Workspace:GetDescendants()) do
+                    if (o:IsA("Model") or o:IsA("BasePart"))
+                        and not o:GetAttribute("Opened")
+                        and not o:GetAttribute("Locked") then
+                        local n = o.Name:lower()
+                        if n:find("chest") or n:find("cofre") or n:find("crate") then
+                            local p = o:IsA("BasePart") and o.Position
+                                or (o.PrimaryPart and o.PrimaryPart.Position)
+                            if p then
+                                local d = (p - r.Position).Magnitude
+                                if d < bestD and d <= Cfg.ChestScanRadius then
+                                    bestD = d
+                                    best = p
+                                end
+                            end
+                        end
+                    end
+                end
+
+                if best then
+                    r.CFrame = CFrame.new(best + Vector3.new(0, 3, 0))
+                    task.wait(0.3)
+                end
+            end)
+        end
+    end
+end)
+
+--=== 22. ТЕЛЕПОРТЫ ===
+local function tpTo(pos)
+    local c = LP.Character
+    local r = c and c:FindFirstChild("HumanoidRootPart")
+    if not r then return false end
+    for i = 1, 3 do
+        r.CFrame = CFrame.new(pos)
+        task.wait(0.15)
+        if (r.Position - pos).Magnitude < 10 then return true end
+    end
+    return false
+end
+
+local function tpToDrill()
+    local drill = Workspace:FindFirstChild("Drill")
+    if not drill then return false end
+    local part = drill:FindFirstChild("DrillPhysicsSeat")
+        or drill:FindFirstChild("VehicleSeat")
+        or drill.PrimaryPart
+        or drill:FindFirstChild("HumanoidRootPart")
+    if not part then return false end
+    local pos = part.Position - part.CFrame.LookVector * 10 + Vector3.new(0, 5, 0)
+    return tpTo(pos)
+end
+
+local function tpToMarket()
+    return tpTo(Vector3.new(13965, 3, -847))
+end
+
+--=== 23. GODMODE SPOOF ===
+local spoofConn, spoofStep
+local oldCF = CFrame.new()
+
+local function applySpoof(on)
+    if spoofConn then spoofConn:Disconnect(); spoofConn = nil end
+    if spoofStep then
+        pcall(function() RunService:UnbindFromRenderStep(spoofStep) end)
+        spoofStep = nil
+    end
+    if not on then return end
+
+    local c = LP.Character
+    local r = c and c:FindFirstChild("HumanoidRootPart")
+    if not r then return end
+
+    oldCF = r.CFrame
+    spoofStep = "3artAimSpoof_" .. tostring(math.random(1, 1e6))
+
+    RunService:BindToRenderStep(spoofStep, Enum.RenderPriority.Camera.Value - 1, function()
+        local ch = LP.Character
+        local rt = ch and ch:FindFirstChild("HumanoidRootPart")
+        if rt then rt.CFrame = oldCF end
+    end)
+    table.insert(RenderSteps, spoofStep)
+
+    spoofConn = RunService.PostSimulation:Connect(function()
+        local ch = LP.Character
+        local rt = ch and ch:FindFirstChild("HumanoidRootPart")
+        if rt then
+            oldCF = rt.CFrame
+            rt.CFrame = CFrame.new(rt.Position - Vector3.yAxis * Cfg.GodModeStuds)
+                * CFrame.Angles(math.rad(90), 0, 0)
+        end
+    end)
+end
+
+--=== 24. ВОССТАНОВЛЕНИЕ ПОСЛЕ СМЕРТИ ===
+track(LP.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    if Cfg.PhaseShift then applyNoClip(true) end
+    if Cfg.RapidMovement then setSpeed(Cfg.MovementSpeed) end
+    if Cfg.InfiniteAirJump then applyAirJump(true) end
+    if Cfg.AerialControl then startFly() end
+    if Cfg.InvisToggle then applySpoof(true) end
+    if Cfg.AntiTrainStuck then applyAntiTrain(true) end
+end))
+
+--=== 25. ОТРИСОВКА ESP ===
+track(RunService.RenderStepped:Connect(function()
+    renderESP()
+    if Cfg.AimEnabled then
+        local model, pos = findTarget()
+        if model and pos then smoothAim(pos) end
+    end
+end))
+--=== 26. СОЗДАНИЕ ОКНА ===
+local Window = Library:CreateWindow({
+    Title = "3artAim · Бур до Ядра",
+    Center = true,
+    AutoShow = true,
+    Resizable = true,
+    NotifySide = "Right",
+    ShowCustomCursor = true,
+})
+
+local Tabs = {
+    Aim    = Window:AddTab({ Name = "Аимбот",    Icon = "crosshair" }),
+    ESP    = Window:AddTab({ Name = "Визуалы",   Icon = "eye" }),
+    Combat = Window:AddTab({ Name = "Бой",       Icon = "sword" }),
+    Move   = Window:AddTab({ Name = "Движение",  Icon = "move" }),
+    Tele   = Window:AddTab({ Name = "Телепорт",  Icon = "navigation" }),
+    Misc   = Window:AddTab({ Name = "Разное",    Icon = "settings" }),
+}
+
+--=== 27. ВКЛАДКА АИМБОТ ===
+local gAim = Tabs.Aim:AddLeftGroupbox("Аимбот")
+gAim:AddToggle("AimEnabled", {
+    Text = "Включить аимбот", Default = false,
+    Tooltip = "Автоматически наводит прицел на врагов",
+    Callback = function(v) Cfg.AimEnabled = v end,
+})
+gAim:AddToggle("AdvancedPrediction", {
+    Text = "Продвинутое предсказание", Default = false,
+    Tooltip = "Учитывает падение снаряда при полёте",
+    Callback = function(v) Cfg.AdvancedPrediction = v end,
+})
+gAim:AddToggle("WallValidation", {
+    Text = "Проверка стен", Default = true,
+    Tooltip = "Не стреляет через препятствия",
+    Callback = function(v) Cfg.WallValidation = v end,
+})
+gAim:AddDropdown("TargetCategory", {
+    Values = { "NPC", "Игроки", "Все" }, Default = 1,
+    Multi = false,
+    Text = "Категория цели",
+    Tooltip = "На кого наводиться",
+    Callback = function(v)
+        if v == "NPC" then Cfg.TargetCategory = "NPCs"
+        elseif v == "Игроки" then Cfg.TargetCategory = "Players"
+        else Cfg.TargetCategory = "Both" end
+    end,
+})
+gAim:AddDropdown("AimBone", {
+    Values = { "Голова", "Торс", "Корень" }, Default = 1,
+    Multi = false,
+    Text = "Кость для прицеливания",
+    Tooltip = "Куда именно целиться",
+    Callback = function(v)
+        if v == "Голова" then Cfg.AimBone = "Head"
+        elseif v == "Торс" then Cfg.AimBone = "UpperTorso"
+        else Cfg.AimBone = "HumanoidRootPart" end
+    end,
+})
+gAim:AddToggle("RespectTeams", {
+    Text = "Уважать союзников", Default = false,
+    Tooltip = "Не целиться в своих по команде",
+    Callback = function(v) Cfg.RespectTeams = v end,
+})
+gAim:AddSlider("AimSmoothing", {
+    Text = "Сглаживание", Default = 0.15,
+    Min = 0.01, Max = 1, Rounding = 2,
+    Tooltip = "0 = мгновенно, 1 = медленно",
+    Callback = function(v) Cfg.AimSmoothing = v end,
+})
+gAim:AddSlider("VelocityPrediction", {
+    Text = "Предсказание скорости", Default = 0.08,
+    Min = 0, Max = 0.2, Rounding = 2,
+    Tooltip = "Насколько учитывать скорость цели",
+    Callback = function(v) Cfg.VelocityPrediction = v end,
+})
+
+local gFOV = Tabs.Aim:AddRightGroupbox("Поле зрения")
+gFOV:AddToggle("ShowFOV", {
+    Text = "Показать FOV", Default = false,
+    Callback = function(v) Cfg.ShowFOV = v end,
+}):AddColorPicker("FOVTint", {
+    Default = Color3.fromRGB(128, 0, 128),
+    Title = "Цвет круга",
+    Callback = function(c) Cfg.FOVTint = c end,
+})
+gFOV:AddSlider("FOVRadius", {
+    Text = "Радиус", Default = 136,
+    Min = 10, Max = 600, Rounding = 0, Suffix = " px",
+    Callback = function(v) Cfg.FOVRadius = v end,
+})
+gFOV:AddSlider("FOVStroke", {
+    Text = "Толщина", Default = 1,
+    Min = 1, Max = 10, Rounding = 0, Suffix = " px",
+    Callback = function(v) Cfg.FOVStroke = v end,
+})
+gFOV:AddToggle("UseRangeLimit", {
+    Text = "Ограничить дистанцию", Default = false,
+    Callback = function(v) Cfg.UseRangeLimit = v end,
+})
+gFOV:AddSlider("MaxAimDistance", {
+    Text = "Макс. дистанция", Default = 200,
+    Min = 10, Max = 2000, Rounding = 0, Suffix = " studs",
+    Callback = function(v) Cfg.MaxAimDistance = v end,
+})
+
+--=== 28. ВКЛАДКА ESP ===
+local gNametags = Tabs.ESP:AddLeftGroupbox("Никнеймы и трассеры")
+gNametags:AddToggle("ShowNametags", {
+    Text = "Показать никнеймы", Default = false,
+    Callback = function(v) Cfg.ShowNametags = v end,
+}):AddColorPicker("NametagColor", {
+    Default = Color3.fromRGB(255, 255, 255),
+    Title = "Цвет текста",
+    Callback = function(c) Cfg.NametagColor = c end,
+})
+gNametags:AddSlider("NametagFontSize", {
+    Text = "Размер шрифта", Default = 12,
+    Min = 8, Max = 24, Rounding = 0, Suffix = " pt",
+    Callback = function(v) Cfg.NametagFontSize = v end,
+})
+gNametags:AddToggle("ShowTracers", {
+    Text = "Показать трассеры", Default = false,
+    Callback = function(v) Cfg.ShowTracers = v end,
+}):AddColorPicker("TracerColor", {
+    Default = Color3.fromRGB(255, 0, 0),
+    Title = "Цвет линий",
+    Callback = function(c) Cfg.TracerColor = c end,
+})
+gNametags:AddSlider("TracerWidth", {
+    Text = "Толщина линий", Default = 1,
+    Min = 1, Max = 5, Rounding = 1, Suffix = " px",
+    Callback = function(v) Cfg.TracerWidth = v end,
+})
+
+local gGlow = Tabs.ESP:AddRightGroupbox("Обводка")
+gGlow:AddToggle("ShowGlow", {
+    Text = "Показать обводку", Default = false,
+    Callback = function(v) Cfg.ShowGlow = v end,
+}):AddColorPicker("GlowOutline", {
+    Default = Color3.fromRGB(0, 255, 0),
+    Title = "Цвет обводки",
+    Callback = function(c) Cfg.GlowOutline = c end,
+})
+gGlow:AddToggle("FullBright", {
+    Text = "Полное освещение (FullBright)", Default = false,
+    Callback = function(v)
+        Cfg.FullBright = v
+        applyFullBright(v)
+    end,
+})
+
+--=== 29. ВКЛАДКА БОЙ ===
+local gFire = Tabs.Combat:AddLeftGroupbox("Авто-стрельба")
+gFire:AddToggle("AutoFire", {
+    Text = "Включить авто-стрельбу", Default = false,
+    Tooltip = "Автоматически стреляет из оружия",
+    Callback = function(v) Cfg.AutoFire = v end,
+})
+gFire:AddSlider("FireRate", {
+    Text = "Задержка между выстрелами", Default = 0.1,
+    Min = 0.05, Max = 1, Rounding = 2, Suffix = " с",
+    Callback = function(v) Cfg.FireRate = v end,
+})
+
+local gSwing = Tabs.Combat:AddLeftGroupbox("Авто-взмах (оружие)")
+gSwing:AddToggle("AutoSwing", {
+    Text = "Включить авто-взмах", Default = false,
+    Callback = function(v) Cfg.AutoSwing = v end,
+})
+gSwing:AddSlider("SwingRadius", {
+    Text = "Радиус взмаха", Default = 15,
+    Min = 5, Max = 50, Rounding = 0, Suffix = " studs",
+    Callback = function(v) Cfg.SwingRadius = v end,
+})
+gSwing:AddSlider("SwingCooldown", {
+    Text = "Задержка", Default = 0.6,
+    Min = 0.1, Max = 2, Rounding = 1, Suffix = " с",
+    Callback = function(v) Cfg.SwingCooldown = v end,
+})
+
+local gHarvest = Tabs.Combat:AddRightGroupbox("Авто-кирка")
+gHarvest:AddToggle("AutoHarvest", {
+    Text = "Включить авто-кирку", Default = false,
+    Tooltip = "Автоматически добывает руду и камень",
+    Callback = function(v) Cfg.AutoHarvest = v end,
+})
+gHarvest:AddSlider("HarvestRadius", {
+    Text = "Радиус добычи", Default = 12,
+    Min = 5, Max = 30, Rounding = 0, Suffix = " studs",
+    Callback = function(v) Cfg.HarvestRadius = v end,
+})
+gHarvest:AddSlider("HarvestCooldown", {
+    Text = "Задержка", Default = 0.22,
+    Min = 0.05, Max = 1, Rounding = 2, Suffix = " с",
+    Callback = function(v) Cfg.HarvestCooldown = v end,
+})
+
+--=== 30. ВКЛАДКА ДВИЖЕНИЕ ===
+local gMove = Tabs.Move:AddLeftGroupbox("Движение")
+gMove:AddToggle("PhaseShift", {
+    Text = "NoClip (сквозь стены)", Default = false,
+    Risky = true,
+    Callback = function(v)
+        Cfg.PhaseShift = v
+        applyNoClip(v)
+    end,
+})
+gMove:AddToggle("RapidMovement", {
+    Text = "Быстрое движение", Default = false,
+    Callback = function(v)
+        Cfg.RapidMovement = v
+        if v then setSpeed(Cfg.MovementSpeed) else setSpeed(16) end
+    end,
+})
+gMove:AddSlider("MovementSpeed", {
+    Text = "Скорость", Default = 50,
+    Min = 1, Max = 500, Rounding = 0,
+    Callback = function(v)
+        Cfg.MovementSpeed = v
+        if Cfg.RapidMovement then setSpeed(v) end
+    end,
+})
+gMove:AddToggle("AntiTrainStuck", {
+    Text = "Анти-застревание в поезде", Default = false,
+    Tooltip = "Автоматически вылезает из сидений и убирает коллизии",
+    Callback = function(v)
+        Cfg.AntiTrainStuck = v
+        applyAntiTrain(v)
+    end,
+})
+
+local gFly = Tabs.Move:AddRightGroupbox("Полёт")
+gFly:AddToggle("AerialControl", {
+    Text = "Полёт (WASD + E/Q)", Default = false,
+    Risky = true,
+    Callback = function(v)
+        Cfg.AerialControl = v
+        if v then startFly() else stopFly() end
+    end,
+})
+gFly:AddSlider("FlightSpeed", {
+    Text = "Скорость полёта", Default = 50,
+    Min = 1, Max = 500, Rounding = 0,
+    Callback = function(v) Cfg.FlightSpeed = v end,
+})
+gFly:AddToggle("InfiniteAirJump", {
+    Text = "Бесконечный прыжок", Default = false,
+    Callback = function(v)
+        Cfg.InfiniteAirJump = v
+        applyAirJump(v)
+    end,
+})
+
+--=== 31. ВКЛАДКА ТЕЛЕПОРТ ===
+local gTele = Tabs.Tele:AddLeftGroupbox("Телепорты")
+gTele:AddButton({
+    Text = "🚂 К буру",
+    Tooltip = "Телепорт к буровой установке",
+    Func = function()
+        if tpToDrill() then
+            Library:Notify("Успешно", { Title = "Телепорт" })
+        else
+            Library:Notify("Бур не найден", { Title = "Ошибка" })
+        end
+    end,
+})
+gTele:AddButton({
+    Text = "🛒 К торговцу",
+    Tooltip = "Телепорт к рыночному обменнику",
+    Func = function()
+        tpToMarket()
+        Library:Notify("Телепорт выполнен", { Title = "Телепорт" })
+    end,
+})
+
+local gLoot = Tabs.Tele:AddRightGroupbox("Авто-лут сундуков")
+gLoot:AddToggle("AutoLootChest", {
+    Text = "Авто-лут ближайшего сундука", Default = false,
+    Callback = function(v) Cfg.AutoLootChest = v end,
+})
+gLoot:AddSlider("ChestScanRadius", {
+    Text = "Радиус сканирования", Default = 500,
+    Min = 50, Max = 2000, Rounding = 0, Suffix = " studs",
+    Callback = function(v) Cfg.ChestScanRadius = v end,
+})
+
+--=== 32. ВКЛАДКА РАЗНОЕ ===
+local gCollect = Tabs.Misc:AddLeftGroupbox("Авто-сбор предметов")
+gCollect:AddToggle("AutoAutoCollect", {
+    Text = "Авто-сбор с земли", Default = false,
+    Tooltip = "Собирает предметы рядом с персонажем",
+    Callback = function(v) Cfg.AutoAutoCollect = v end,
+})
+
+local gCamera = Tabs.Misc:AddRightGroupbox("Камера")
+gCamera:AddSlider("CameraDistance", {
+    Text = "Отдаление камеры", Default = 500,
+    Min = 128, Max = 2000, Rounding = 0, Suffix = " studs",
+    Callback = function(v)
+        Cfg.CameraDistance = v
+        applyCameraDistance(v)
+    end,
+})
+gCamera:AddButton({
+    Text = "Применить отдаление",
+    Func = function()
+        applyCameraDistance(Cfg.CameraDistance)
+        Library:Notify("Камера: " .. Cfg.CameraDistance, { Title = "Готово" })
+    end,
+})
+
+local gGod = Tabs.Misc:AddLeftGroupbox("GodMode Spoof")
+gGod:AddToggle("InvisToggle", {
+    Text = "Включить GodMode", Default = false,
+    Risky = true,
+    Callback = function(v)
+        Cfg.InvisToggle = v
+        applySpoof(v)
+    end,
+})
+gGod:AddSlider("GodModeStuds", {
+    Text = "Глубина", Default = 7,
+    Min = 0, Max = 50, Rounding = 0, Suffix = " studs",
+    Callback = function(v)
+        Cfg.GodModeStuds = v
+        if Cfg.InvisToggle then
+            applySpoof(false)
+            task.wait(0.1)
+            applySpoof(true)
+        end
+    end,
+})
+
+local gInterface = Tabs.Misc:AddRightGroupbox("Интерфейс")
+gInterface:AddButton({
+    Text = "⚠ Выгрузить скрипт",
+    Risky = true,
+    Func = function()
+        for _, c in ipairs(Connections) do
+            pcall(function() c:Disconnect() end)
+        end
+        for _, n in ipairs(RenderSteps) do
+            pcall(function() RunService:UnbindFromRenderStep(n) end)
+        end
+        if EspGui then EspGui:Destroy() end
+        applyFullBright(false)
+        applyNoClip(false)
+        stopFly()
+        applyAirJump(false)
+        applyAntiTrain(false)
+        applySpoof(false)
+        Library:Unload()
+    end,
+})
+
+--=== 33. ПРИМЕНИТЬ НАЧАЛЬНЫЕ НАСТРОЙКИ ===
+applyCameraDistance(Cfg.CameraDistance)
+
+--=== 34. FPS / PING СЧЁТЧИК ===
+local fpsLabel = Library:AddDraggableLabel({ Text = "FPS: -- | Ping: --ms" })
+local fps, ping = 0, 0
+
+track(RunService.Heartbeat:Connect(function(dt)
+    if dt > 0 then fps = math.floor(1 / dt) end
+end))
+
+task.spawn(function()
+    while task.wait(1) do
+        pcall(function()
+            ping = math.floor(LP:GetNetworkPing() * 1000)
+        end)
+    end
+end)
+
+task.spawn(function()
+    while fpsLabel do
+        local txt = string.format("FPS: %d | Ping: %dms", fps, ping)
+        pcall(function()
+            if fpsLabel.Set then fpsLabel:Set(txt)
+            elseif fpsLabel.SetText then fpsLabel:SetText(txt)
+            else fpsLabel.Text = txt end
+        end)
+        task.wait(0.2)
+    end
+end)
+
+--=== 35. ЗАВЕРШЕНИЕ ===
+Library:Notify("Скрипт успешно загружен!", {
+    Title = "3artAim",
+    Time = 5,
+})
+print("[3artAim] Скрипт успешно запущен. Всего соединений: " .. #Connections)
